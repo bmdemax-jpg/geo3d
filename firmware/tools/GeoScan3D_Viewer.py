@@ -119,7 +119,22 @@ class BleWorker:
                 target = device
             self.client = BleakClient(target)
             await self.client.connect()
-            await self.client.start_notify(NUS_TX_UUID, self._on_notify)
+            # Windows sometimes returns a stale/incomplete cached GATT service
+            # table right after connect, especially just after a pairing was
+            # removed; re-resolving services and retrying a couple of times
+            # clears it up without the user having to click Connect again.
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    await self.client.get_services()
+                    await self.client.start_notify(NUS_TX_UUID, self._on_notify)
+                    last_exc = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    await asyncio.sleep(1.0)
+            if last_exc is not None:
+                raise last_exc
             self.events.put(("connected", self.client.address))
         except Exception as exc:  # noqa: BLE001
             self.events.put(("error", str(exc)))
