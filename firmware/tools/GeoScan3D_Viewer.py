@@ -117,22 +117,29 @@ class BleWorker:
                     self.events.put(("error", f"Device '{name}' not found"))
                     return
                 target = device
-            self.client = BleakClient(target)
-            await self.client.connect()
-            # Windows sometimes returns a stale/incomplete cached GATT service
-            # table right after connect, especially just after a pairing was
-            # removed; re-resolving services and retrying a couple of times
-            # clears it up without the user having to click Connect again.
+            # Windows sometimes hands back a stale/incomplete cached GATT
+            # service table right after connect (especially just after an
+            # OS-level pairing was removed), so start_notify fails with
+            # "Characteristic ... was not found!" even though the connect
+            # itself succeeded. A full disconnect+reconnect cycle clears it;
+            # retry that a few times instead of making the user click
+            # Connect again by hand.
             last_exc = None
-            for attempt in range(3):
+            for attempt in range(4):
+                self.client = BleakClient(target)
                 try:
-                    await self.client.get_services()
+                    await self.client.connect()
+                    await asyncio.sleep(0.5)  # let Windows finish resolving services
                     await self.client.start_notify(NUS_TX_UUID, self._on_notify)
                     last_exc = None
                     break
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
-                    await asyncio.sleep(1.0)
+                    try:
+                        await self.client.disconnect()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await asyncio.sleep(1.5)
             if last_exc is not None:
                 raise last_exc
             self.events.put(("connected", self.client.address))
