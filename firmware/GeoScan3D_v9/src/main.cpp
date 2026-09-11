@@ -19,6 +19,11 @@
 //       كلاسيكي (SPP) على ويندوز بمجرد تغيير الاسم؛ الاتصال هنا يبقى عبر BLE
 //       (Nordic UART Service) كما في v9.4 — أي تطبيق عميل (مثل Visualizer 3D)
 //       يجب أن يتصل عبر BLE GATT لا عبر منفذ COM كلاسيكي.
+// v9.6: دعم أوامر واستقبال بث نصي عبر USB Serial (115200) بالتوازي مع BLE —
+//       نفس محلل أوامر BLE (parseBleCommand) يعمل الآن أيضاً عبر Serial، وسطر
+//       GRAD/DEPTH/DET/MODE النصي يُكتب لـ Serial دائماً بغض النظر عن اتصال BLE.
+//       بديل سلكي موثوق عند تعذّر مكدس BLE على بعض أجهزة ويندوز (COM عبر الكابل
+//       بدلاً من com0com/bleak) — لا يغيّر أي شيء في سلوك BLE نفسه.
 // ملف أحادي متكامل حسب SPEC.md (§1..§13)
 // =============================================================
 
@@ -1095,6 +1100,25 @@ class RxCB : public BLECharacteristicCallbacks {
   }
 };
 
+// v9.5: أوامر بديلة عبر USB Serial — نفس محلل أوامر BLE (parseBleCommand)، لتفادي
+// مشاكل مكدس BLE على بعض أجهزة ويندوز (GATT cache/E_ABORT) بربط سلكي موثوق كبديل.
+static void serviceSerialCommands() {
+  static char buf[BLE_CMD_MAX + 1];
+  static size_t len = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (len > 0) {
+        buf[len] = 0;
+        parseBleCommand(buf);
+        len = 0;
+      }
+    } else if (len < BLE_CMD_MAX) {
+      buf[len++] = c;
+    }
+  }
+}
+
 void bleInit() {
   BLEDevice::init(BLE_DEVICE_NAME);
   BLEDevice::setMTU(BLE_MTU);             // MTU 64 بعد init (SPEC §8)
@@ -1148,7 +1172,7 @@ void sendBlePacket() {
 // اختيرت صيغة CSV مفتاحية (key,value) بدل رقم خام لأنها تُقرأ مباشرة في أي طرفية
 // نصية (Serial Bluetooth Terminal ونحوها) دون الحاجة لفك تشفير بنية ثنائية.
 void sendBleTextLine() {
-  if (!g_bleConnected || g_bleSending || !g_bleTxChar) return;
+  if (g_bleSending) return;
   SensorData s; uint8_t m;
   xSemaphoreTake(xMutex, portMAX_DELAY);
   s = g_sensor; m = g_mode;
@@ -1157,10 +1181,15 @@ void sendBleTextLine() {
   char line[80];
   int n = snprintf(line, sizeof(line), "GRAD,%.2f,DEPTH,%.1f,DET,%u,MODE,%s\r\n",
                    (double)s.anomaly, (double)s.depthCm, (unsigned)s.detect, mc);
-  g_bleSending = true;
-  g_bleTxChar->setValue((uint8_t*)line, (size_t)n);
-  g_bleTxChar->notify();
-  g_bleSending = false;
+  // v9.5: مرآة دائمة عبر USB Serial بغض النظر عن حالة اتصال BLE — تتيح استخدام
+  // الجهاز عبر الكابل مباشرة كبديل موثوق عند تعذّر BLE على جهاز الكمبيوتر.
+  Serial.write((const uint8_t*)line, (size_t)n);
+  if (g_bleConnected && g_bleTxChar) {
+    g_bleSending = true;
+    g_bleTxChar->setValue((uint8_t*)line, (size_t)n);
+    g_bleTxChar->notify();
+    g_bleSending = false;
+  }
 }
 #endif
 
@@ -2114,11 +2143,13 @@ void loop() {
   }
   pumpBleDump();
   serviceFileRequests();
+  serviceSerialCommands();                // v9.5: أوامر بديلة عبر USB Serial
 #if TEXT_STREAM_ENABLE
   // v9.4: بث السطر النصي (بديل CH05) — مؤقّت مستقل عن الحزمة الثنائية حتى لا يزدحم مكدس BLE
+  // v9.5: لم يعد يتطلب g_bleConnected — sendBleTextLine() نفسها تكتب لـ Serial دائماً
   static uint32_t lastTxt = 0;
   uint32_t txtInterval = (g_mode == MODE_LIVE) ? TEXT_STREAM_LIVE_MS : TEXT_STREAM_SCAN_MS;
-  if (g_textStreamOn && g_bleConnected && !g_bleSending && !g_dumpActive &&
+  if (g_textStreamOn && !g_bleSending && !g_dumpActive &&
       millis() - lastTxt >= txtInterval) {
     lastTxt = millis();
     sendBleTextLine();
