@@ -83,7 +83,13 @@ class SerialWorker:
                     cmd = self.commands.get_nowait()
                     self.ser.write((cmd + "\n").encode("ascii"))
                     self.events.put(("sent", cmd))
-                data = self.ser.read(256)
+                try:
+                    data = self.ser.read(256)
+                except serial.SerialException:
+                    # Cable unplugged or device reset mid-session -- treat as a
+                    # normal disconnect instead of an unhandled traceback.
+                    self.events.put(("log", "USB cable disconnected"))
+                    break
                 if data:
                     buf += data
                     while b"\n" in buf:
